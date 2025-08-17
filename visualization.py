@@ -1,9 +1,9 @@
-# visualization.py
 import plotly.graph_objs as go
 import pandas as pd
-import streamlit as st
+from .data_loader import calculate_max_drawdown  # local import
 
-def plot_price_trend(norm_df: pd.DataFrame, pct_change_from_start: pd.DataFrame, labels, top_symbols):
+# ---------- Line charts ----------
+def plot_price_trend(norm_df: pd.DataFrame, labels, top_symbols, pct_change_from_start: pd.DataFrame):
     fig = go.Figure()
     for sym in top_symbols:
         fig.add_trace(go.Scatter(
@@ -12,53 +12,49 @@ def plot_price_trend(norm_df: pd.DataFrame, pct_change_from_start: pd.DataFrame,
             customdata=pct_change_from_start.loc[sym].values.reshape(-1, 1),
             mode='lines+markers',
             name=sym,
-            text=[sym]*len(labels),
+            text=[sym] * len(labels),
             hovertemplate="<b>%{text}</b><br>Price: %{y:.2f}<br>Change: %{customdata[0]:.2f}%"
         ))
     fig.update_layout(hovermode="x unified", height=500, title="Price Trend — Top 20 by Return")
-    st.plotly_chart(fig, use_container_width=True)
+    return fig
 
-def plot_normalized(norm_df: pd.DataFrame, labels, top_symbols):
+def plot_normalized_performance(norm_df: pd.DataFrame, labels, top_symbols):
     start_values = norm_df.iloc[:, 0]
-    total_pct_change = ((norm_df.iloc[:, -1] - norm_df.iloc[:, 0]) / norm_df.iloc[:, 0] * 100).fillna(0)
-    normed_pct = norm_df.divide(start_values, axis=0) * 100
+    total_pct_change = ((norm_df.iloc[:, -1] - start_values) / start_values) * 100
+    pct_change_from_start = norm_df.subtract(start_values, axis=0).divide(start_values, axis=0) * 100
+
     fig = go.Figure()
+    normed_pct = norm_df.divide(start_values, axis=0) * 100
     for sym in top_symbols:
-        label_name = f"{sym} ({total_pct_change[sym]:+.2f}%)"
+        change = total_pct_change[sym]
+        label_name = f"{sym} ({change:+.2f}%)"
         fig.add_trace(go.Scatter(
             x=labels,
             y=normed_pct.loc[sym],
+            customdata=pct_change_from_start.loc[sym].values.reshape(-1, 1),
             mode="lines",
             name=label_name,
-            text=[label_name]*len(labels),
-            hovertemplate="<b>%{text}</b><br>Normalized: %{y:.2f}"
+            text=[label_name] * len(labels),
+            hovertemplate="<b>%{text}</b><br>Normalized: %{y:.2f}<br>Change: %{customdata[0]:.2f}%"
         ))
     fig.update_layout(hovermode="closest", height=500, title="Normalized — Top 20 by Return")
-    st.plotly_chart(fig, use_container_width=True)
+    return fig
 
-def plot_drawdown_bar(drawdown_df: pd.DataFrame):
+# ---------- Bars / Pies ----------
+def plot_drawdowns(norm_df: pd.DataFrame, top_symbols):
+    drawdowns = norm_df.loc[top_symbols].apply(
+        lambda row: calculate_max_drawdown(row.dropna()), axis=1
+    ).dropna()
     fig = go.Figure(go.Bar(
-        x=drawdown_df.index,
-        y=drawdown_df.iloc[:, 0].values,
+        x=drawdowns.index,
+        y=drawdowns.values,
+        marker_color="crimson",
         hovertemplate="%{x}<br>Drawdown: %{y:.2f}%"
     ))
     fig.update_layout(title="Drawdown (%) — Top 20 by Return", yaxis_title="Drawdown", height=500)
-    st.plotly_chart(fig, use_container_width=True)
+    return fig, drawdowns.rename("Drawdown (%)").round(2).reset_index()
 
-def pie_breakdowns(meta_df: pd.DataFrame):
-    with st.expander("📊 Composition Breakdown (Pie Charts)"):
-        if "Sector" in meta_df.columns:
-            c = meta_df["Sector"].value_counts()
-            st.plotly_chart(go.Figure([go.Pie(labels=c.index, values=c.values, hole=.3)])
-                            .update_layout(title_text="Sector Distribution"),
-                            use_container_width=True)
-        if "Industry Group" in meta_df.columns:
-            c = meta_df["Industry Group"].value_counts()
-            st.plotly_chart(go.Figure([go.Pie(labels=c.index, values=c.values, hole=.3)])
-                            .update_layout(title_text="Industry Group Distribution"),
-                            use_container_width=True)
-        if "Industry" in meta_df.columns:
-            c = meta_df["Industry"].value_counts()
-            st.plotly_chart(go.Figure([go.Pie(labels=c.index, values=c.values, hole=.3)])
-                            .update_layout(title_text="Industry Distribution"),
-                            use_container_width=True)
+def pie_distribution(series: pd.Series, title: str):
+    fig = go.Figure(data=[go.Pie(labels=series.index, values=series.values, hole=.3)])
+    fig.update_layout(title_text=title)
+    return fig
