@@ -22,8 +22,13 @@ uploaded_file = st.file_uploader("Upload your Excel file", type="xlsx")
 
 if uploaded_file:
     # Let user pick sheet
-    xls = pd.ExcelFile(uploaded_file)
-    sheet_names = xls.sheet_names
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+        sheet_names = xls.sheet_names
+    except Exception as e:
+        st.error(f"Could not read Excel file: {e}")
+        st.stop()
+
     sheet_choice = st.selectbox("Select sheet to analyze", [""] + sheet_names)
 
     if sheet_choice:
@@ -33,7 +38,7 @@ if uploaded_file:
             st.error("Excel must contain a 'Symbol' column.")
             st.stop()
 
-        # Sidebar filters
+        # Sidebar filters (metadata only)
         available_filters = get_available_filters(df)
         selections = {}
         for col in available_filters:
@@ -68,27 +73,29 @@ if uploaded_file:
             top_symbols = total_pct_change.sort_values(ascending=False).head(top_n).index.tolist()
             pct_change_from_start = norm_df.subtract(start_values, axis=0).divide(start_values, axis=0) * 100
 
-            tabs = st.tabs([
-                "📈 Price Trend",
-                "📊 Normalized Performance",
-                "📈 % Weekly Change",
-                "🎯 Ticker Scores",
-                "📉 Max Drawdown",
-                "📉 Volatility"
-            ])
+            tabs = st.tabs(
+                [
+                    "📈 Price Trend",
+                    "📊 Normalized Performance",
+                    "📈 % Weekly Change",
+                    "🎯 Ticker Scores",
+                    "📉 Max Drawdown",
+                    "📉 Volatility",
+                ]
+            )
 
             with tabs[0]:
                 st.subheader("📈 Price Trend")
                 st.plotly_chart(
                     plot_price_trend(norm_df, labels, top_symbols, pct_change_from_start),
-                    use_container_width=True
+                    use_container_width=True,
                 )
 
             with tabs[1]:
                 st.subheader("📊 Normalized Performance (Start = 100)")
                 st.plotly_chart(
                     plot_normalized_performance(norm_df, labels, top_symbols),
-                    use_container_width=True
+                    use_container_width=True,
                 )
 
             with tabs[2]:
@@ -101,10 +108,21 @@ if uploaded_file:
                 scores["Momentum"] = (norm_df.iloc[:, -1] - norm_df.iloc[:, -2]).fillna(0)
                 scores["Volatility"] = norm_df.std(axis=1).fillna(0)
                 scores["Trend"] = norm_df.apply(lambda row: sum(row.diff().fillna(0) > 0), axis=1)
-                scores["Total Return (%)"] = ((norm_df.iloc[:, -1] - norm_df.iloc[:, 0]) / norm_df.iloc[:, 0] * 100).fillna(0)
+                scores["Total Return (%)"] = (
+                    (norm_df.iloc[:, -1] - norm_df.iloc[:, 0]) / norm_df.iloc[:, 0] * 100
+                ).fillna(0)
                 scores["All-Around"] = scores.sum(axis=1)
 
-                metadata_cols = ["Name", "Sector", "Industry Group", "Industry", "Theme", "Country", "Asset_Type", "Notes"]
+                metadata_cols = [
+                    "Name",
+                    "Sector",
+                    "Industry Group",
+                    "Industry",
+                    "Theme",
+                    "Country",
+                    "Asset_Type",
+                    "Notes",
+                ]
                 avail = [c for c in metadata_cols if c in filtered_df.columns]
                 missing = [c for c in metadata_cols if c not in filtered_df.columns]
                 if missing:
@@ -112,8 +130,10 @@ if uploaded_file:
                 meta = filtered_df.set_index("Symbol")[avail].copy()
                 combined = meta.join(scores, how="right")
 
-                st.dataframe(combined.round(2).sort_values("All-Around", ascending=False).reset_index(),
-                             use_container_width=True)
+                st.dataframe(
+                    combined.round(2).sort_values("All-Around", ascending=False).reset_index(),
+                    use_container_width=True,
+                )
 
             with tabs[4]:
                 st.subheader("📉 Max Drawdown")
@@ -124,27 +144,19 @@ if uploaded_file:
             with tabs[5]:
                 st.subheader("📉 Volatility (Standard Deviation of Weekly % Change)")
                 volatility = weekly_pct.std(axis=1).fillna(0)
-                st.dataframe(volatility.rename("Volatility (%)").round(2).reset_index(), use_container_width=True)
+                st.dataframe(
+                    volatility.rename("Volatility (%)").round(2).reset_index(),
+                    use_container_width=True,
+                )
 
                 with st.expander("📌 Live Intraday Data"):
                     merged_live = (
-                        price_df[["Symbol"] + labels[-1:]]  # keep last period column for context if you want
+                        price_df[["Symbol"] + labels[-1:]]
                         .merge(live_pct_df, on="Symbol", how="left")
                         .merge(intraday_df, on="Symbol", how="left")
                     )
                     st.dataframe(
                         merged_live[["Symbol", "Live Price", "Intraday % Change", "Live % Change"]]
                         .sort_values("Intraday % Change", ascending=False),
-                        use_container_width=True
+                        use_container_width=True,
                     )
-
-            with st.expander("📊 Composition Breakdown (Pie Charts)"):
-                if "Sector" in filtered_df.columns:
-                    st.plotly_chart(pie_distribution(filtered_df["Sector"].value_counts(), "Sector Distribution"),
-                                    use_container_width=True)
-                if "Industry Group" in filtered_df.columns:
-                    st.plotly_chart(pie_distribution(filtered_df["Industry Group"].value_counts(), "Industry Group Distribution"),
-                                    use_container_width=True)
-                if "Industry" in filtered_df.columns:
-                    st.plotly_chart(pie_distribution(filtered_df["Industry"].value_counts(), "Industry Distribution"),
-                                    use_container_width=True)
