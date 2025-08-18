@@ -1,14 +1,15 @@
 # visualization.py
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Local helper duplicated here to avoid tight coupling/circular imports.
+# --- small helper, duplicated locally to avoid tight coupling ---
 def _calculate_max_drawdown(prices: pd.Series) -> float:
     if prices is None or prices.empty:
         return float("nan")
-    s = prices.astype(float).dropna()
+    s = pd.to_numeric(prices, errors="coerce").dropna()
     if s.empty:
         return float("nan")
     cum_max = s.cummax()
@@ -16,18 +17,44 @@ def _calculate_max_drawdown(prices: pd.Series) -> float:
     return float(drawdown.min() * 100.0)
 
 
+def _coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure all cells are numeric where possible (silently coerce)."""
+    out = df.copy()
+    for c in out.columns:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+
+def _sort_columns_as_dates_if_possible(df: pd.DataFrame) -> pd.DataFrame:
+    """If columns look like dates, sort them chronologically; else keep as-is."""
+    cols = list(df.columns)
+    try:
+        as_dt = pd.to_datetime(cols, errors="raise")
+        order = np.argsort(as_dt.values)
+        return df.iloc[:, order]
+    except Exception:
+        return df
+
+
+def _last_valid_numeric(series: pd.Series) -> float:
+    """Return last non-NaN numeric value in a row (or NaN)."""
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    return float(vals.iloc[-1]) if not vals.empty else np.nan
+
+
 def _top_n_by_last_value(wide_df: pd.DataFrame, n: int | None) -> pd.DataFrame:
     """
-    Keep only the top-n rows by their LAST column value (descending).
-    Assumes rows = symbols, columns = dates (ascending). If n is None, return as-is.
+    Keep only the top-n rows by their LAST VALID column value (descending).
+    Assumes rows = symbols, columns = dates. Handles NaNs and unordered columns.
     """
     if wide_df is None or wide_df.empty or n is None:
         return wide_df
-    # last valid column
-    last_col = wide_df.columns[-1]
-    scores = pd.to_numeric(wide_df[last_col], errors="coerce")
-    keep = scores.sort_values(ascending=False).head(n).index
-    return wide_df.loc[keep]
+
+    df = _coerce_numeric_df(_sort_columns_as_dates_if_possible(wide_df))
+
+    scores = df.apply(_last_valid_numeric, axis=1)
+    keep_idx = scores.sort_values(ascending=False).head(n).index
+    return df.loc[keep_idx]
 
 
 def render_weekly_pct_heatmap(weekly_pct: pd.DataFrame):
@@ -49,23 +76,26 @@ def render_weekly_pct_heatmap(weekly_pct: pd.DataFrame):
 def render_normalized_chart(norm_df: pd.DataFrame, top_n: int | None = None):
     """
     Interactive line chart of normalized prices (start=100).
-    - norm_df: rows = symbols (index), columns = dates (YYYY-MM-DD)
-    - top_n: if set, show only top N symbols by latest value.
+    - norm_df: rows = symbols (index), columns = dates (strings)
+    - top_n: if set, show only top N symbols by latest valid value.
     """
     if norm_df is None or norm_df.empty:
         st.info("Normalized table is empty — nothing to plot.")
         return
 
-    # Filter to top-n before plotting
-    df = norm_df.copy()
+    # Safeguards: sort date columns & coerce numbers
+    df = _sort_columns_as_dates_if_possible(norm_df.copy())
+    df = _coerce_numeric_df(df)
+
+    # Filter to Top-N BEFORE plotting
     df = _top_n_by_last_value(df, top_n)
 
-    # Ensure index has a consistent name before reset_index/melt
+    # Ensure index has a name
     if df.index.name is None or str(df.index.name).strip() == "":
         df.index.name = "Symbol"
-    idx_col = df.index.name  # "Symbol"
+    idx_col = df.index.name
 
-    # Long-form for plotting
+    # Long form
     long = (
         df.reset_index()
           .melt(id_vars=idx_col, var_name="Date", value_name="Value")
@@ -73,13 +103,17 @@ def render_normalized_chart(norm_df: pd.DataFrame, top_n: int | None = None):
           .dropna(subset=["Value"])
     )
 
-    # Coerce Date to datetime for proper temporal axis
+    # Parse Date for temporal axis
     try:
         long["Date"] = pd.to_datetime(long["Date"])
     except Exception:
         pass
 
-    # Plot with Altair if available; fallback to Streamlit line_chart
+    # Display how many lines are shown
+    shown = long["Symbol"].nunique()
+    st.caption(f"Showing {shown} series" + (f" (Top {top_n})" if top_n else " (All)"))
+
+    # Plot
     try:
         import altair as alt
         chart = (
@@ -96,7 +130,6 @@ def render_normalized_chart(norm_df: pd.DataFrame, top_n: int | None = None):
         )
         st.altair_chart(chart, use_container_width=True)
     except Exception:
-        # Fallback: pivot to wide for line_chart (Date as index)
         wide = long.pivot(index="Date", columns="Symbol", values="Value").sort_index()
         st.line_chart(wide, height=420, use_container_width=True)
 
@@ -106,13 +139,14 @@ def render_drawdown_table(price_df: pd.DataFrame):
     Compute & render max drawdown per symbol using raw weekly closes in `price_df`.
     `price_df` is expected as rows=symbols, first col 'Symbol', others = dates.
     """
-    if price_df is None or price_df.empty or "Symbol" not in price_df.columns or price_df.shape[1] <= 2:
+    if (price_df is None or price_df.empty or
+        "Symbol" not in price_df.columns or price_df.shape[1] <= 2):
         st.info("Not enough data to compute drawdowns.")
         return
 
     dd_rows = []
     for sym, row in price_df.set_index("Symbol").iterrows():
-        series = row.dropna().astype(float)
+        series = pd.to_numeric(row.dropna(), errors="coerce")
         dd = _calculate_max_drawdown(series)
         dd_rows.append({"Symbol": sym, "Max Drawdown %": dd})
 
