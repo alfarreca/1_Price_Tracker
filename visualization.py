@@ -16,6 +16,20 @@ def _calculate_max_drawdown(prices: pd.Series) -> float:
     return float(drawdown.min() * 100.0)
 
 
+def _top_n_by_last_value(wide_df: pd.DataFrame, n: int | None) -> pd.DataFrame:
+    """
+    Keep only the top-n rows by their LAST column value (descending).
+    Assumes rows = symbols, columns = dates (ascending). If n is None, return as-is.
+    """
+    if wide_df is None or wide_df.empty or n is None:
+        return wide_df
+    # last valid column
+    last_col = wide_df.columns[-1]
+    scores = pd.to_numeric(wide_df[last_col], errors="coerce")
+    keep = scores.sort_values(ascending=False).head(n).index
+    return wide_df.loc[keep]
+
+
 def render_weekly_pct_heatmap(weekly_pct: pd.DataFrame):
     """Heatmap-like styled DataFrame."""
     if weekly_pct is None or weekly_pct.empty:
@@ -32,24 +46,31 @@ def render_weekly_pct_heatmap(weekly_pct: pd.DataFrame):
         st.dataframe(weekly_pct, use_container_width=True, height=480)
 
 
-def render_normalized_chart(norm_df: pd.DataFrame):
-    """Interactive line chart of normalized prices (start=100), robust to index naming."""
+def render_normalized_chart(norm_df: pd.DataFrame, top_n: int | None = None):
+    """
+    Interactive line chart of normalized prices (start=100).
+    - norm_df: rows = symbols (index), columns = dates (YYYY-MM-DD)
+    - top_n: if set, show only top N symbols by latest value.
+    """
     if norm_df is None or norm_df.empty:
         st.info("Normalized table is empty — nothing to plot.")
         return
 
+    # Filter to top-n before plotting
+    df = norm_df.copy()
+    df = _top_n_by_last_value(df, top_n)
+
     # Ensure index has a consistent name before reset_index/melt
-    tmp = norm_df.copy()
-    if tmp.index.name is None or str(tmp.index.name).strip() == "":
-        tmp.index.name = "Symbol"
-    idx_col = tmp.index.name  # e.g., "Symbol"
+    if df.index.name is None or str(df.index.name).strip() == "":
+        df.index.name = "Symbol"
+    idx_col = df.index.name  # "Symbol"
 
     # Long-form for plotting
     long = (
-        tmp.reset_index()
-           .melt(id_vars=idx_col, var_name="Date", value_name="Value")
-           .rename(columns={idx_col: "Symbol"})
-           .dropna(subset=["Value"])
+        df.reset_index()
+          .melt(id_vars=idx_col, var_name="Date", value_name="Value")
+          .rename(columns={idx_col: "Symbol"})
+          .dropna(subset=["Value"])
     )
 
     # Coerce Date to datetime for proper temporal axis
@@ -89,7 +110,6 @@ def render_drawdown_table(price_df: pd.DataFrame):
         st.info("Not enough data to compute drawdowns.")
         return
 
-    syms = price_df["Symbol"].tolist()
     dd_rows = []
     for sym, row in price_df.set_index("Symbol").iterrows():
         series = row.dropna().astype(float)
