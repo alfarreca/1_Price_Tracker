@@ -18,7 +18,6 @@ def _calculate_max_drawdown(prices: pd.Series) -> float:
 
 
 def _coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure all cells are numeric where possible (silently coerce)."""
     out = df.copy()
     for c in out.columns:
         out[c] = pd.to_numeric(out[c], errors="coerce")
@@ -26,7 +25,6 @@ def _coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _sort_columns_as_dates_if_possible(df: pd.DataFrame) -> pd.DataFrame:
-    """If columns look like dates, sort them chronologically; else keep as-is."""
     cols = list(df.columns)
     try:
         as_dt = pd.to_datetime(cols, errors="raise")
@@ -36,22 +34,20 @@ def _sort_columns_as_dates_if_possible(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
 
+def _first_valid_numeric(series: pd.Series) -> float:
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    return float(vals.iloc[0]) if not vals.empty else np.nan
+
+
 def _last_valid_numeric(series: pd.Series) -> float:
-    """Return last non-NaN numeric value in a row (or NaN)."""
     vals = pd.to_numeric(series, errors="coerce").dropna()
     return float(vals.iloc[-1]) if not vals.empty else np.nan
 
 
 def _top_n_by_last_value(wide_df: pd.DataFrame, n: int | None) -> pd.DataFrame:
-    """
-    Keep only the top-n rows by their LAST VALID column value (descending).
-    Assumes rows = symbols, columns = dates. Handles NaNs and unordered columns.
-    """
     if wide_df is None or wide_df.empty or n is None:
         return wide_df
-
     df = _coerce_numeric_df(_sort_columns_as_dates_if_possible(wide_df))
-
     scores = df.apply(_last_valid_numeric, axis=1)
     keep_idx = scores.sort_values(ascending=False).head(n).index
     return df.loc[keep_idx]
@@ -63,11 +59,7 @@ def render_weekly_pct_heatmap(weekly_pct: pd.DataFrame):
         st.info("Weekly % Change table is empty — nothing to show.")
         return
     try:
-        sty = (
-            weekly_pct.style
-            .format("{:.2f}")
-            .background_gradient(axis=None)
-        )
+        sty = weekly_pct.style.format("{:.2f}").background_gradient(axis=None)
         st.dataframe(sty, use_container_width=True, height=480)
     except Exception:
         st.dataframe(weekly_pct, use_container_width=True, height=480)
@@ -78,30 +70,43 @@ def render_normalized_chart(norm_df: pd.DataFrame, top_n: int | None = None):
     Interactive line chart of normalized prices (start=100).
     - norm_df: rows = symbols (index), columns = dates (strings)
     - top_n: if set, show only top N symbols by latest valid value.
+    Legend shows "SYMBOL (+x.x%)" where % is change from first valid point in window.
     """
     if norm_df is None or norm_df.empty:
         st.info("Normalized table is empty — nothing to plot.")
         return
 
-    # Safeguards: sort date columns & coerce numbers
+    # Sort dates & coerce numerics
     df = _sort_columns_as_dates_if_possible(norm_df.copy())
     df = _coerce_numeric_df(df)
 
-    # Filter to Top-N BEFORE plotting
+    # Filter to Top-N BEFORE computing labels
     df = _top_n_by_last_value(df, top_n)
+
+    # Build % change per symbol across the visible window
+    start_vals = df.apply(_first_valid_numeric, axis=1)
+    end_vals   = df.apply(_last_valid_numeric, axis=1)
+    pct_change = (end_vals / start_vals - 1.0) * 100.0
+    # Label like: "CBK.DE (+12.3%)"
+    labels_map = {
+        sym: f"{sym} ({(pct_change.get(sym) if pd.notna(pct_change.get(sym)) else 0):+0.1f}%)"
+        for sym in df.index
+    }
 
     # Ensure index has a name
     if df.index.name is None or str(df.index.name).strip() == "":
         df.index.name = "Symbol"
-    idx_col = df.index.name
+    idx_col = df.index.name  # "Symbol"
 
-    # Long form
+    # Long-form + attach label & pct for legend/tooltip
     long = (
         df.reset_index()
           .melt(id_vars=idx_col, var_name="Date", value_name="Value")
           .rename(columns={idx_col: "Symbol"})
           .dropna(subset=["Value"])
     )
+    long["SymbolLabel"] = long["Symbol"].map(labels_map)
+    long["Window_%Change"] = long["Symbol"].map(pct_change)
 
     # Parse Date for temporal axis
     try:
@@ -109,7 +114,6 @@ def render_normalized_chart(norm_df: pd.DataFrame, top_n: int | None = None):
     except Exception:
         pass
 
-    # Display how many lines are shown
     shown = long["Symbol"].nunique()
     st.caption(f"Showing {shown} series" + (f" (Top {top_n})" if top_n else " (All)"))
 
@@ -122,15 +126,21 @@ def render_normalized_chart(norm_df: pd.DataFrame, top_n: int | None = None):
             .encode(
                 x="Date:T",
                 y=alt.Y("Value:Q", title="Index (Start=100)"),
-                color="Symbol:N",
-                tooltip=["Symbol", "Date:T", alt.Tooltip("Value:Q", format=".2f")],
+                color=alt.Color("SymbolLabel:N", title="Symbol"),
+                tooltip=[
+                    "Symbol",
+                    alt.Tooltip("Window_%Change:Q", title="Window %", format="+.1f"),
+                    "Date:T",
+                    alt.Tooltip("Value:Q", title="Index", format=".2f"),
+                ],
             )
             .properties(height=420)
             .interactive()
         )
         st.altair_chart(chart, use_container_width=True)
     except Exception:
-        wide = long.pivot(index="Date", columns="Symbol", values="Value").sort_index()
+        # Fallback: pivot to wide for line_chart (Date as index)
+        wide = long.pivot(index="Date", columns="SymbolLabel", values="Value").sort_index()
         st.line_chart(wide, height=420, use_container_width=True)
 
 
