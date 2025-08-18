@@ -1,168 +1,210 @@
-import pandas as pd
+# data_loader.py
+import io
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Tuple
+
 import numpy as np
+import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta
 
-# ---------- Date helpers ----------
-def get_last_n_weeks(n: int):
-    """
-    Returns a list of (monday, friday) tuples for the last n weeks
-    aligned to Friday, and the last Friday date.
-    """
-    today = datetime.today()
-    offset = (today.weekday() - 4) % 7  # 4 = Friday
-    last_friday = today - timedelta(days=offset)
-    weeks = [
-        (last_friday - timedelta(weeks=i) - timedelta(days=4),  # Monday
-         last_friday - timedelta(weeks=i))                      # Friday
-        for i in reversed(range(n))
-    ]
-    return weeks, last_friday
 
-# ---------- Yahoo helpers ----------
-def fetch_friday_closes(symbol: str, weeks):
-    start_date, end_date = weeks[0][0], weeks[-1][1]
-    df = yf.download(symbol, start=start_date, end=end_date + timedelta(days=1),
-                     interval="1d", progress=False)
-    if df.empty or "Close" not in df.columns:
-        return [np.nan] * len(weeks)
+# ------------ Excel helpers ------------
 
-    closes = []
-    for monday, friday in weeks:
-        week_data = df[(df.index >= monday) & (df.index <= friday)]
-        close = week_data[week_data.index.weekday == 4]["Close"].dropna()
-        if not close.empty:
-            closes.append(float(round(close.iloc[-1], 3)))
-        else:
-            fallback = week_data["Close"].dropna()
-            closes.append(float(round(fallback.iloc[-1], 3)) if not fallback.empty else np.nan)
-    return closes
-
-def fetch_current_week_close(symbol: str, current_week_start):
-    today = datetime.today()
-    df = yf.download(symbol, start=current_week_start, end=today + timedelta(days=1),
-                     interval="1d", progress=False)
-    if df.empty or "Close" not in df.columns:
-        return np.nan
-    closes = df["Close"].dropna()
-    if closes.empty:
-        return np.nan
-    return round(float(closes.iloc[-1]), 3)
-
-def fetch_intraday_live_price(symbol: str):
-    try:
-        info = yf.Ticker(symbol).info
-        current_price = info.get("regularMarketPrice")
-        prev_close = info.get("regularMarketPreviousClose")
-        if current_price is not None and prev_close not in (None, 0):
-            pct_change = ((current_price - prev_close) / prev_close) * 100
-        else:
-            pct_change = np.nan
-        return round(current_price, 3) if current_price is not None else np.nan, \
-               round(pct_change, 2) if isinstance(pct_change, (int, float, np.floating)) else np.nan
-    except Exception:
-        return np.nan, np.nan
-
-# ---------- Analytics ----------
-def calculate_max_drawdown(prices):
-    """
-    prices: 1D iterable of prices (floats). Returns drawdown in % (negative number).
-    """
-    if prices is None or len(prices) < 2:
-        return 0.0
-    arr = np.array(prices, dtype=np.float64)
-    running_max = np.maximum.accumulate(arr)
-    drawdowns = (arr - running_max) / running_max
-    return float(drawdowns.min() * 100)
-
-# ---------- IO / Filtering ----------
 def read_excel_to_df(uploaded_file, sheet_name: str) -> pd.DataFrame:
-    return pd.read_excel(uploaded_file, sheet_name=sheet_name)
+    # Works with Streamlit's UploadedFile
+    xls = pd.ExcelFile(uploaded_file)
+    df = pd.read_excel(xls, sheet_name=sheet_name)
+    # Normalize column names
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
-def get_available_filters(df: pd.DataFrame):
-    candidates = ["Sector", "Industry Group", "Industry", "Theme", "Country", "Asset_Type"]
-    return [c for c in candidates if c in df.columns]
 
-def apply_filter_selections(df: pd.DataFrame, selections: dict) -> pd.DataFrame:
+def get_available_filters(df: pd.DataFrame) -> List[str]:
+    # Offer common metadata filters if they exist and have >1 unique value
+    candidates = [
+        "Sector", "Industry Group", "Industry", "Theme",
+        "Country", "Asset_Type", "Notes", "Name"
+    ]
+    out = []
+    for c in candidates:
+        if c in df.columns:
+            uniq = df[c].dropna().unique()
+            if len(uniq) > 1:
+                out.append(c)
+    return out
+
+
+def apply_filter_selections(df: pd.DataFrame, selections: Dict[str, List[str]]) -> pd.DataFrame:
     out = df.copy()
     for col, vals in selections.items():
-        if col in out.columns and vals:
+        if vals:
             out = out[out[col].isin(vals)]
     return out
 
-# ---------- Pipeline to build all tables ----------
-def build_price_tables(symbols):
-    """
-    Given a list of symbols, compute:
-    - labels (list of week labels)
-    - price_df (wide table with weekly Friday closes + current)
-    - weekly_pct (weekly % changes)
-    - live_pct_df (df with Live % Change vs last Friday close)
-    - intraday_df (df with Live Price and Intraday % Change vs prev close)
-    - norm_df (prices only, indexed by Symbol; columns=labels)
-    """
-    weeks, last_friday = get_last_n_weeks(6)
-    current_week_start = last_friday
 
-    intraday_price, intraday_change, all_data = {}, {}, {}
+# ------------ Price fetching & table builders ------------
+
+def _safe_download(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+    """
+    yfinance sometimes returns empty data; wrap and normalize.
+    """
+    try:
+        df = yf.download(
+            symbol,
+            start=start,
+            end=end + timedelta(days=1),  # inclusive last day
+            interval="1d",
+            progress=False,
+            auto_adjust=True,
+            threads=False,
+        )
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            # Ensure DatetimeIndex timezone-naive (resample expects that)
+            if isinstance(df.index, pd.DatetimeIndex):
+                if df.index.tz is not None:
+                    df.index = df.index.tz_convert("UTC").tz_localize(None)
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def fetch_friday_closes(symbol: str, weeks: int = 26) -> pd.Series | None:
+    """
+    Return a Series of Friday closes indexed by week-ending date.
+    None if there is not enough data.
+    """
+    today = datetime.now(timezone.utc).date()
+    # generous buffer to increase chance of getting enough Fridays
+    lookback_days = weeks * 7 + 42
+    start_date = datetime.combine(today - timedelta(days=lookback_days), datetime.min.time())
+    end_date = datetime.combine(today, datetime.min.time())
+
+    daily = _safe_download(symbol, start_date, end_date)
+    if daily.empty or "Close" not in daily.columns:
+        return None
+
+    # Resample to W-FRI and take last available Close in each week
+    weekly = daily["Close"].resample("W-FRI").last().dropna()
+
+    # In thin markets/holidays, W-FRI can miss a print; try forward-fill within week if needed
+    if weekly.empty and not daily.empty:
+        # backstop: use business-weekly anchor (W-FRI via asfreq) then fill from last valid close
+        idx = pd.date_range(daily.index.min(), daily.index.max(), freq="W-FRI")
+        tmp = daily["Close"].reindex(idx, method="pad")
+        weekly = tmp.dropna()
+
+    if weekly.empty:
+        return None
+
+    # Keep the last `weeks` observations; require at least 2 to compute changes
+    weekly = weekly.tail(weeks)
+    if weekly.shape[0] < 2:
+        return None
+
+    return weekly
+
+
+def _compute_live_and_intraday(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute:
+      - Intraday % Change (today vs prior close)
+      - Live Price
+      - Live % Change (today vs prior close)  [kept same definition for safety]
+    If we fail to fetch, fill NaNs so the UI can still render.
+    """
+    live_rows = []
+    intra_rows = []
+
     for sym in symbols:
-        price, change = fetch_intraday_live_price(sym)
-        intraday_price[sym] = price
-        intraday_change[sym] = change
+        live_price = np.nan
+        intraday_pct = np.nan
+        live_pct = np.nan
 
-        closes = fetch_friday_closes(sym, weeks)
-        current = fetch_current_week_close(sym, current_week_start)
-        all_data[sym] = closes + [current]
+        try:
+            # 5d/1d to get prior close + latest close
+            hist = yf.Ticker(sym).history(period="5d", interval="1d", auto_adjust=True)
+            if not hist.empty and "Close" in hist.columns:
+                close_vals = hist["Close"].dropna()
+                if close_vals.shape[0] >= 2:
+                    prev_close = float(close_vals.iloc[-2])
+                    last_close = float(close_vals.iloc[-1])
+                    live_price = last_close
+                    if prev_close > 0:
+                        change = last_close - prev_close
+                        intraday_pct = (change / prev_close) * 100.0
+                        live_pct = intraday_pct
+        except Exception:
+            pass
 
-    labels = [f"{m.strftime('%b %d')}→{f.strftime('%b %d')}" for m, f in weeks]
-    labels += [f"{current_week_start.strftime('%b %d')}→{datetime.today().strftime('%b %d')}"]
+        live_rows.append({"Symbol": sym, "Live % Change": live_pct, "Live Price": live_price})
+        intra_rows.append({"Symbol": sym, "Intraday % Change": intraday_pct})
 
-    price_df = pd.DataFrame(all_data).T
-    price_df.columns = labels
-    price_df.index.name = "Symbol"
-    price_df = price_df.reset_index()
+    live_df = pd.DataFrame(live_rows)
+    intra_df = pd.DataFrame(intra_rows)
+    return live_df, intra_df
 
-    # ensure numeric
-    for col in labels:
-        price_df[col] = pd.to_numeric(price_df[col], errors="coerce")
 
-    # Live % change vs last Friday close
-    live_pct_change = {}
-    for sym in all_data:
-        last_friday_close = all_data[sym][-2] if len(all_data[sym]) >= 2 else np.nan
-        current_price = all_data[sym][-1]
-        if pd.notna(last_friday_close) and pd.notna(current_price) and last_friday_close != 0:
-            live_change = ((current_price - last_friday_close) / last_friday_close) * 100
-        else:
-            live_change = np.nan
-        live_pct_change[sym] = round(live_change, 2) if pd.notna(live_change) else np.nan
+def build_price_tables(symbols: List[str], weeks: int = 26) -> Dict[str, pd.DataFrame]:
+    """
+    Build:
+      - price_df: rows=symbols, cols=[labels...], plus 'Symbol' column
+      - weekly_pct: rows=symbols, cols=[labels...]
+      - norm_df: rows=symbols, cols=[labels...], normalized (start=100)
+      - live_pct_df: ['Symbol','Live % Change','Live Price']
+      - intraday_df: ['Symbol','Intraday % Change']
+      - labels: list of week-ending date strings
+      - skipped: list of symbols we couldn’t fetch
+    """
+    symbols = [str(s).strip() for s in symbols if str(s).strip()]
+    series_map: Dict[str, pd.Series] = {}
+    skipped: List[str] = []
 
-    live_pct_df = pd.DataFrame.from_dict(live_pct_change, orient='index', columns=["Live % Change"]).reset_index().rename(columns={"index": "Symbol"})
-    intraday_df = pd.DataFrame({"Symbol": list(intraday_price.keys()),
-                                "Live Price": list(intraday_price.values()),
-                                "Intraday % Change": list(intraday_change.values())})
+    for sym in symbols:
+        s = fetch_friday_closes(sym, weeks=weeks)
+        if s is None or s.empty:
+            skipped.append(sym)
+            continue
+        # ensure name for later alignment
+        s.name = sym
+        series_map[sym] = s
 
-    # Build normalized tables
-    norm_df = price_df.set_index("Symbol")[labels]
-    safe_norm = norm_df.copy()
-    safe_norm = safe_norm.where(norm_df.iloc[:, 0] != 0)
-    normed = safe_norm.div(norm_df.iloc[:, 0], axis=0)  # not returned but used for checks
+    if not series_map:
+        raise ValueError(
+            "No weekly price data could be fetched for the selected symbols. "
+            "Check symbol formats/exchanges or broaden the date window."
+        )
 
-    weekly_pct = norm_df.pct_change(axis=1) * 100
+    # Align all series on the union of week-ending dates, then trim to last `weeks`
+    all_df = pd.concat(series_map.values(), axis=1).T  # rows=symbols, cols=dates
+    # Sort columns (dates) ascending; keep last `weeks`
+    all_df = all_df.reindex(sorted(all_df.columns), axis=1)
+    all_df = all_df.iloc[:, -weeks:]
 
-    # Remove degenerate last column if it's “start==end” or all equal
-    last_label = weekly_pct.columns[-1]
-    left, right = last_label.split("→")
-    if left == right or weekly_pct.iloc[:, -1].nunique() <= 1:
-        weekly_pct = weekly_pct.iloc[:, :-1]
-        norm_df = norm_df.iloc[:, :-1]
-        labels = labels[:-1]
+    # Labels (week-ending dates as strings)
+    labels = [c.strftime("%Y-%m-%d") for c in all_df.columns]
 
-    return {
+    # price_df in the shape analysis.py expects: include 'Symbol' column
+    price_df = all_df.copy()
+    price_df.insert(0, "Symbol", price_df.index)
+
+    # Weekly % change per symbol per label
+    weekly_pct = all_df.pct_change(axis=1) * 100.0
+
+    # Normalized (start = 100)
+    start_vals = all_df.iloc[:, 0].replace(0, np.nan)
+    norm_df = all_df.divide(start_vals, axis=0) * 100.0
+
+    # Live & intraday
+    live_pct_df, intraday_df = _compute_live_and_intraday(list(all_df.index))
+
+    pack = {
         "labels": labels,
-        "price_df": price_df,
-        "weekly_pct": weekly_pct,
-        "live_pct_df": live_pct_df,
-        "intraday_df": intraday_df,
-        "norm_df": norm_df
+        "price_df": price_df,             # rows = symbols
+        "weekly_pct": weekly_pct,         # index = symbols, columns = labels
+        "live_pct_df": live_pct_df,       # ['Symbol','Live % Change','Live Price']
+        "intraday_df": intraday_df,       # ['Symbol','Intraday % Change']
+        "norm_df": norm_df,               # index = symbols, columns = labels
+        "skipped": skipped,               # symbols with no data
     }
+    return pack
