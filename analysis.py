@@ -147,7 +147,32 @@ if run:
     with tabs[2]:
         st.subheader("Normalized Price (Start = 100)")
         st.caption("Quick relative performance view across symbols.")
-        render_normalized_chart(norm_df)
+
+        # ---- Top-N segmented control ----
+        # If your Streamlit version doesn't support segmented_control, radio works the same.
+        try:
+            top_choice = st.segmented_control(
+                "Show",
+                options=["All", "Top 5", "Top 10", "Top 20"],
+                default="All",
+                help="Ranked by latest normalized value (highest = best).",
+            )
+        except Exception:
+            top_choice = st.radio(
+                "Show",
+                ["All", "Top 5", "Top 10", "Top 20"],
+                index=0,
+                help="Ranked by latest normalized value (highest = best).",
+                horizontal=True,
+            )
+
+        top_map = {"All": None, "Top 5": 5, "Top 10": 10, "Top 20": 20}
+        top_n = top_map.get(top_choice, None)
+
+        # Plot only the requested Top N
+        render_normalized_chart(norm_df, top_n=top_n)
+
+        # Also show the underlying table for transparency
         st.dataframe(norm_df, use_container_width=True, height=300)
 
     # ---------- Live & Intraday ----------
