@@ -1,5 +1,4 @@
 # data_loader.py
-import io
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 
@@ -41,6 +40,23 @@ def apply_filter_selections(df: pd.DataFrame, selections: Dict[str, List[str]]) 
         if vals:
             out = out[out[col].isin(vals)]
     return out
+
+
+# ------------ Risk helpers ------------
+
+def calculate_max_drawdown(prices: pd.Series) -> float:
+    """
+    Max drawdown in percent (negative number).
+    `prices` should be a price-like series (no NaNs ideally).
+    """
+    if prices is None or prices.empty:
+        return np.nan
+    s = prices.astype(float).dropna()
+    if s.empty:
+        return np.nan
+    cum_max = s.cummax()
+    drawdown = (s / cum_max) - 1.0
+    return float(drawdown.min() * 100.0)
 
 
 # ------------ Price fetching & table builders ------------
