@@ -18,24 +18,47 @@ def _calculate_max_drawdown(prices: pd.Series) -> float:
 
 def render_weekly_pct_heatmap(weekly_pct: pd.DataFrame):
     """Heatmap-like styled DataFrame."""
+    if weekly_pct is None or weekly_pct.empty:
+        st.info("Weekly % Change table is empty — nothing to show.")
+        return
     try:
-        sty = (weekly_pct
-               .style
-               .format("{:.2f}")
-               .background_gradient(axis=None))
+        sty = (
+            weekly_pct.style
+            .format("{:.2f}")
+            .background_gradient(axis=None)
+        )
         st.dataframe(sty, use_container_width=True, height=480)
     except Exception:
         st.dataframe(weekly_pct, use_container_width=True, height=480)
 
 
 def render_normalized_chart(norm_df: pd.DataFrame):
-    """Interactive line chart of normalized prices."""
+    """Interactive line chart of normalized prices (start=100), robust to index naming."""
+    if norm_df is None or norm_df.empty:
+        st.info("Normalized table is empty — nothing to plot.")
+        return
+
+    # Ensure index has a consistent name before reset_index/melt
+    tmp = norm_df.copy()
+    if tmp.index.name is None or str(tmp.index.name).strip() == "":
+        tmp.index.name = "Symbol"
+    idx_col = tmp.index.name  # e.g., "Symbol"
+
+    # Long-form for plotting
     long = (
-        norm_df.reset_index()
-               .melt(id_vars="index", var_name="Date", value_name="Value")
-               .rename(columns={"index": "Symbol"})
-               .dropna()
+        tmp.reset_index()
+           .melt(id_vars=idx_col, var_name="Date", value_name="Value")
+           .rename(columns={idx_col: "Symbol"})
+           .dropna(subset=["Value"])
     )
+
+    # Coerce Date to datetime for proper temporal axis
+    try:
+        long["Date"] = pd.to_datetime(long["Date"])
+    except Exception:
+        pass
+
+    # Plot with Altair if available; fallback to Streamlit line_chart
     try:
         import altair as alt
         chart = (
@@ -52,7 +75,9 @@ def render_normalized_chart(norm_df: pd.DataFrame):
         )
         st.altair_chart(chart, use_container_width=True)
     except Exception:
-        st.line_chart(norm_df.T, height=420, use_container_width=True)
+        # Fallback: pivot to wide for line_chart (Date as index)
+        wide = long.pivot(index="Date", columns="Symbol", values="Value").sort_index()
+        st.line_chart(wide, height=420, use_container_width=True)
 
 
 def render_drawdown_table(price_df: pd.DataFrame):
@@ -60,7 +85,7 @@ def render_drawdown_table(price_df: pd.DataFrame):
     Compute & render max drawdown per symbol using raw weekly closes in `price_df`.
     `price_df` is expected as rows=symbols, first col 'Symbol', others = dates.
     """
-    if "Symbol" not in price_df.columns or price_df.shape[1] <= 2:
+    if price_df is None or price_df.empty or "Symbol" not in price_df.columns or price_df.shape[1] <= 2:
         st.info("Not enough data to compute drawdowns.")
         return
 
