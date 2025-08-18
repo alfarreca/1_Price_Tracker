@@ -1,89 +1,76 @@
-import plotly.graph_objs as go
+# visualization.py
+from __future__ import annotations
+
 import pandas as pd
-from data_loader import calculate_max_drawdown  # absolute import for Streamlit Cloud
+import streamlit as st
+
+# Local helper duplicated here to avoid tight coupling/circular imports.
+def _calculate_max_drawdown(prices: pd.Series) -> float:
+    if prices is None or prices.empty:
+        return float("nan")
+    s = prices.astype(float).dropna()
+    if s.empty:
+        return float("nan")
+    cum_max = s.cummax()
+    drawdown = (s / cum_max) - 1.0
+    return float(drawdown.min() * 100.0)
 
 
-# ---------- Line charts ----------
-def plot_price_trend(norm_df: pd.DataFrame, labels, top_symbols, pct_change_from_start: pd.DataFrame):
-    """
-    Line chart of raw price series (not normalized) for top_symbols.
-    Hover shows per-point % change from start.
-    """
-    fig = go.Figure()
-    for sym in top_symbols:
-        fig.add_trace(
-            go.Scatter(
-                x=labels,
-                y=norm_df.loc[sym],
-                customdata=pct_change_from_start.loc[sym].values.reshape(-1, 1),
-                mode="lines+markers",
-                name=sym,
-                text=[sym] * len(labels),
-                hovertemplate="<b>%{text}</b><br>Price: %{y:.2f}"
-                              "<br>Change from start: %{customdata[0]:.2f}%"
-            )
-        )
-    fig.update_layout(hovermode="x unified", height=500, title="Price Trend — Top 20 by Return")
-    return fig
+def render_weekly_pct_heatmap(weekly_pct: pd.DataFrame):
+    """Heatmap-like styled DataFrame."""
+    try:
+        sty = (weekly_pct
+               .style
+               .format("{:.2f}")
+               .background_gradient(axis=None))
+        st.dataframe(sty, use_container_width=True, height=480)
+    except Exception:
+        st.dataframe(weekly_pct, use_container_width=True, height=480)
 
 
-def plot_normalized_performance(norm_df: pd.DataFrame, labels, top_symbols):
-    """
-    Normalizes each series to 100 at the first column and plots Top N.
-    """
-    start_values = norm_df.iloc[:, 0]
-    total_pct_change = ((norm_df.iloc[:, -1] - start_values) / start_values) * 100
-    pct_change_from_start = norm_df.subtract(start_values, axis=0).divide(start_values, axis=0) * 100
-
-    normed_pct = norm_df.divide(start_values, axis=0) * 100
-
-    fig = go.Figure()
-    for sym in top_symbols:
-        change = total_pct_change[sym]
-        label_name = f"{sym} ({change:+.2f}%)"
-        fig.add_trace(
-            go.Scatter(
-                x=labels,
-                y=normed_pct.loc[sym],
-                customdata=pct_change_from_start.loc[sym].values.reshape(-1, 1),
-                mode="lines",
-                name=label_name,
-                text=[label_name] * len(labels),
-                hovertemplate="<b>%{text}</b><br>Normalized: %{y:.2f}"
-                              "<br>Change from start: %{customdata[0]:.2f}%"
-            )
-        )
-    fig.update_layout(hovermode="closest", height=500, title="Normalized — Top 20 by Return (Start=100)")
-    return fig
-
-
-# ---------- Bars / Pies ----------
-def plot_drawdowns(norm_df: pd.DataFrame, top_symbols):
-    """
-    Computes max drawdown (%) per symbol and returns (figure, table_df).
-    """
-    drawdowns = norm_df.loc[top_symbols].apply(
-        lambda row: calculate_max_drawdown(row.dropna()), axis=1
-    ).dropna()
-
-    fig = go.Figure(
-        go.Bar(
-            x=drawdowns.index,
-            y=drawdowns.values,
-            marker_color="crimson",
-            hovertemplate="%{x}<br>Drawdown: %{y:.2f}%"
-        )
+def render_normalized_chart(norm_df: pd.DataFrame):
+    """Interactive line chart of normalized prices."""
+    long = (
+        norm_df.reset_index()
+               .melt(id_vars="index", var_name="Date", value_name="Value")
+               .rename(columns={"index": "Symbol"})
+               .dropna()
     )
-    fig.update_layout(title="Max Drawdown (%) — Top 20 by Return", yaxis_title="Drawdown (%)", height=500)
+    try:
+        import altair as alt
+        chart = (
+            alt.Chart(long)
+            .mark_line()
+            .encode(
+                x="Date:T",
+                y=alt.Y("Value:Q", title="Index (Start=100)"),
+                color="Symbol:N",
+                tooltip=["Symbol", "Date:T", alt.Tooltip("Value:Q", format=".2f")],
+            )
+            .properties(height=420)
+            .interactive()
+        )
+        st.altair_chart(chart, use_container_width=True)
+    except Exception:
+        st.line_chart(norm_df.T, height=420, use_container_width=True)
 
-    dd_table = drawdowns.rename("Drawdown (%)").round(2).reset_index()
-    return fig, dd_table
 
-
-def pie_distribution(series: pd.Series, title: str):
+def render_drawdown_table(price_df: pd.DataFrame):
     """
-    Simple pie chart for a categorical series .value_counts().
+    Compute & render max drawdown per symbol using raw weekly closes in `price_df`.
+    `price_df` is expected as rows=symbols, first col 'Symbol', others = dates.
     """
-    fig = go.Figure(data=[go.Pie(labels=series.index, values=series.values, hole=0.3)])
-    fig.update_layout(title_text=title)
-    return fig
+    if "Symbol" not in price_df.columns or price_df.shape[1] <= 2:
+        st.info("Not enough data to compute drawdowns.")
+        return
+
+    syms = price_df["Symbol"].tolist()
+    dd_rows = []
+    for sym, row in price_df.set_index("Symbol").iterrows():
+        series = row.dropna().astype(float)
+        dd = _calculate_max_drawdown(series)
+        dd_rows.append({"Symbol": sym, "Max Drawdown %": dd})
+
+    dd_df = pd.DataFrame(dd_rows).sort_values("Max Drawdown %")
+    st.subheader("Max Drawdown (based on weekly closes)")
+    st.dataframe(dd_df, use_container_width=True, height=360)
