@@ -47,7 +47,8 @@ st.title("📈 Weekly Price Tracker (W-FRI Closes)")
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.header("⚙️ Controls")
-    weeks = st.selectbox("Lookback (weeks)", [13, 26, 52], index=1, key="weeks_sel")
+    weeks = st.selectbox("Lookback (weeks)", [6, 13, 26, 52], index=2, key="weeks_sel")  # default=26w
+
     src = st.radio("Symbols source", ["Upload Excel", "Paste manually"], index=0, key="src_sel")
 
     uploaded = None
