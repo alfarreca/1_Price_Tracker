@@ -1,0 +1,171 @@
+# visualization.py
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# --- small helper, duplicated locally to avoid tight coupling ---
+def _calculate_max_drawdown(prices: pd.Series) -> float:
+    if prices is None or prices.empty:
+        return float("nan")
+    s = pd.to_numeric(prices, errors="coerce").dropna()
+    if s.empty:
+        return float("nan")
+    cum_max = s.cummax()
+    drawdown = (s / cum_max) - 1.0
+    return float(drawdown.min() * 100.0)
+
+
+def _coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+
+def _sort_columns_as_dates_if_possible(df: pd.DataFrame) -> pd.DataFrame:
+    cols = list(df.columns)
+    try:
+        as_dt = pd.to_datetime(cols, errors="raise")
+        order = np.argsort(as_dt.values)
+        return df.iloc[:, order]
+    except Exception:
+        return df
+
+
+def _first_valid_numeric(series: pd.Series) -> float:
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    return float(vals.iloc[0]) if not vals.empty else np.nan
+
+
+def _last_valid_numeric(series: pd.Series) -> float:
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    return float(vals.iloc[-1]) if not vals.empty else np.nan
+
+
+def _top_n_by_last_value(wide_df: pd.DataFrame, n: int | None) -> pd.DataFrame:
+    if wide_df is None or wide_df.empty or n is None:
+        return wide_df
+    df = _coerce_numeric_df(_sort_columns_as_dates_if_possible(wide_df))
+    scores = df.apply(_last_valid_numeric, axis=1)
+    keep_idx = scores.sort_values(ascending=False).head(n).index
+    return df.loc[keep_idx]
+
+
+def render_weekly_pct_heatmap(weekly_pct: pd.DataFrame):
+    """Heatmap-like styled DataFrame."""
+    if weekly_pct is None or weekly_pct.empty:
+        st.info("Weekly % Change table is empty — nothing to show.")
+        return
+    try:
+        sty = weekly_pct.style.format("{:.2f}").background_gradient(axis=None)
+        st.dataframe(sty, use_container_width=True, height=480)
+    except Exception:
+        st.dataframe(weekly_pct, use_container_width=True, height=480)
+
+
+def render_normalized_chart(norm_df: pd.DataFrame, top_n: int | None = None):
+    """
+    Interactive line chart of normalized prices (start=100).
+    - norm_df: rows = symbols (index), columns = dates (strings)
+    - top_n: if set, show only top N symbols by latest valid value.
+    Legend shows "SYMBOL (+x.x%)" where % is change from first valid point in window.
+    """
+    if norm_df is None or norm_df.empty:
+        st.info("Normalized table is empty — nothing to plot.")
+        return
+
+    # Sort dates & coerce numerics
+    df = _sort_columns_as_dates_if_possible(norm_df.copy())
+    df = _coerce_numeric_df(df)
+
+    # Filter to Top-N BEFORE computing labels
+    df = _top_n_by_last_value(df, top_n)
+
+    # Build % change per symbol across the visible window
+    start_vals = df.apply(_first_valid_numeric, axis=1)
+    end_vals   = df.apply(_last_valid_numeric, axis=1)
+    pct_change = (end_vals / start_vals - 1.0) * 100.0
+    # Vectorized, robust label building: align to df.index and coerce to float
+    chg = pct_change.reindex(df.index)
+    if chg.index.has_duplicates:
+        chg = chg.groupby(level=0).last()
+        chg = chg.reindex(df.index)
+    chg = pd.to_numeric(chg, errors='coerce').fillna(0.0)
+    label_series = chg.map(lambda v: f"{v:+0.1f}%")
+    labels_map = {sym: f"{sym} ({label_series.loc[sym]})" for sym in df.index}
+
+    # Ensure index has a name
+    if df.index.name is None or str(df.index.name).strip() == "":
+        df.index.name = "Symbol"
+    idx_col = df.index.name  # "Symbol"
+
+    # Long-form + attach label & pct for legend/tooltip
+    long = (
+        df.reset_index()
+          .melt(id_vars=idx_col, var_name="Date", value_name="Value")
+          .rename(columns={idx_col: "Symbol"})
+          .dropna(subset=["Value"])
+    )
+    long["SymbolLabel"] = long["Symbol"].map(labels_map)
+    # Map Window % using a unique-index dict to avoid InvalidIndexError on duplicates
+    _pct_unique = pct_change[~pct_change.index.duplicated(keep="last")]
+    _pct_unique = pd.to_numeric(_pct_unique, errors="coerce").fillna(0.0)
+    long["Window_%Change"] = long["Symbol"].map(_pct_unique.to_dict())
+
+    # Parse Date for temporal axis
+    try:
+        long["Date"] = pd.to_datetime(long["Date"])
+    except Exception:
+        pass
+
+    shown = long["Symbol"].nunique()
+    st.caption(f"Showing {shown} series" + (f" (Top {top_n})" if top_n else " (All)"))
+
+    # Plot
+    try:
+        import altair as alt
+        chart = (
+            alt.Chart(long)
+            .mark_line()
+            .encode(
+                x="Date:T",
+                y=alt.Y("Value:Q", title="Index (Start=100)"),
+                color=alt.Color("SymbolLabel:N", title="Symbol"),
+                tooltip=[
+                    "Symbol",
+                    alt.Tooltip("Window_%Change:Q", title="Window %", format="+.1f"),
+                    "Date:T",
+                    alt.Tooltip("Value:Q", title="Index", format=".2f"),
+                ],
+            )
+            .properties(height=420)
+            .interactive()
+        )
+        st.altair_chart(chart, use_container_width=True)
+    except Exception:
+        # Fallback: pivot to wide for line_chart (Date as index)
+        wide = long.pivot(index="Date", columns="SymbolLabel", values="Value").sort_index()
+        st.line_chart(wide, height=420, use_container_width=True)
+
+
+def render_drawdown_table(price_df: pd.DataFrame):
+    """
+    Compute & render max drawdown per symbol using raw weekly closes in `price_df`.
+    `price_df` is expected as rows=symbols, first col 'Symbol', others = dates.
+    """
+    if (price_df is None or price_df.empty or
+        "Symbol" not in price_df.columns or price_df.shape[1] <= 2):
+        st.info("Not enough data to compute drawdowns.")
+        return
+
+    dd_rows = []
+    for sym, row in price_df.set_index("Symbol").iterrows():
+        series = pd.to_numeric(row.dropna(), errors="coerce")
+        dd = _calculate_max_drawdown(series)
+        dd_rows.append({"Symbol": sym, "Max Drawdown %": dd})
+
+    dd_df = pd.DataFrame(dd_rows).sort_values("Max Drawdown %")
+    st.subheader("Max Drawdown (based on weekly closes)")
+    st.dataframe(dd_df, use_container_width=True, height=360)
